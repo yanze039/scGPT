@@ -3,6 +3,7 @@ import math
 from typing import Dict, Mapping, Optional, Tuple, Any, Union
 
 import torch
+import torch.nn as nn
 import numpy as np
 from torch import nn, Tensor
 import torch.distributed as dist
@@ -11,15 +12,15 @@ from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from torch.distributions import Bernoulli
 from tqdm import trange
 
-try:
-    from flash_attn.flash_attention import FlashMHA
+# try:
+#     from flash_attn.flash_attention import FlashMHA
 
-    flash_attn_available = True
-except ImportError:
-    import warnings
+#     flash_attn_available = True
+# except ImportError:
+#     import warnings
 
-    warnings.warn("flash_attn is not installed")
-    flash_attn_available = False
+#     warnings.warn("flash_attn is not installed")
+#     flash_attn_available = False
 
 from .dsbn import DomainSpecificBatchNorm1d
 from .grad_reverse import grad_reverse
@@ -72,15 +73,16 @@ class TransformerModel(nn.Module):
             )
         if cell_emb_style not in ["cls", "avg-pool", "w-pool"]:
             raise ValueError(f"Unknown cell_emb_style: {cell_emb_style}")
-        if use_fast_transformer:
-            if not flash_attn_available:
-                warnings.warn(
-                    "flash-attn is not installed, using pytorch transformer instead. "
-                    "Set use_fast_transformer=False to avoid this warning. "
-                    "Installing flash-attn is highly recommended."
-                )
-                use_fast_transformer = False
-        self.use_fast_transformer = use_fast_transformer
+        # if use_fast_transformer:
+        #     if not flash_attn_available:
+        #         warnings.warn(
+        #             "flash-attn is not installed, using pytorch transformer instead. "
+        #             "Set use_fast_transformer=False to avoid this warning. "
+        #             "Installing flash-attn is highly recommended."
+        #         )
+        #         use_fast_transformer = False
+        # self.use_fast_transformer = use_fast_transformer
+        self.use_fast_transformer = True
 
         # TODO: add dropout in the GeneEncoder
         self.encoder = GeneEncoder(ntoken, d_model, padding_idx=vocab[pad_token])
@@ -160,7 +162,7 @@ class TransformerModel(nn.Module):
         self.init_weights()
 
     def init_weights(self) -> None:
-        initrange = 0.1
+        initrange = 0.01
         # TODO: check if this initialization is helpful and shall we apply to all?
         self.encoder.embedding.weight.data.uniform_(-initrange, initrange)
 
@@ -177,6 +179,7 @@ class TransformerModel(nn.Module):
         self.cur_gene_token_embs = src
 
         values = self.value_encoder(values)  # (batch, seq_len, embsize)
+
         if self.input_emb_style == "scaling":
             values = values.unsqueeze(2)
             total_embs = src * values
@@ -592,6 +595,8 @@ class FastTransformerEncoderWrapper(nn.Module):
         return output
 
 
+from .mha import TorchPackedMHA
+
 class FlashTransformerEncoderLayer(nn.Module):
     r"""TransformerEncoderLayer is made up of self-attn and feedforward network.
     The class is modified from torch.nn.TransformerEncoderLayer to support the
@@ -634,11 +639,19 @@ class FlashTransformerEncoderLayer(nn.Module):
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-        self.self_attn = FlashMHA(
+        
+        # self.self_attn = FlashMHA(
+        #     embed_dim=d_model,
+        #     num_heads=nhead,
+        #     batch_first=batch_first,
+        #     attention_dropout=dropout,
+        #     **factory_kwargs,
+        # )
+        self.self_attn = TorchPackedMHA(
             embed_dim=d_model,
             num_heads=nhead,
+            dropout=dropout,
             batch_first=batch_first,
-            attention_dropout=dropout,
             **factory_kwargs,
         )
         # Version compatibility workaround
@@ -701,7 +714,7 @@ class FlashTransformerEncoderLayer(nn.Module):
                 src_key_padding_mask = src_key_padding_mask.bool()
             # NOTE: the FlashMHA uses mask 0 for padding tokens, which is the opposite
             src_key_padding_mask_ = ~src_key_padding_mask
-
+        self.norm_scheme = "pre"
         if self.norm_scheme == "pre":
             src = self.norm1(src)
             src2 = self.self_attn(src, key_padding_mask=src_key_padding_mask_)[0]
